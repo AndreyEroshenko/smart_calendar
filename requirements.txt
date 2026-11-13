@@ -1,0 +1,6 @@
+anthropic>=2.8
+python-telegram-bot>=22.0
+google-api-python-client>=2.150
+google-auth-oauthlib>=1.2
+pydantic>=2.9
+tzdata
