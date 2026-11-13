@@ -1,5 +1,5 @@
 """Google Calendar client. Credentials come from scripts/google_auth.py (OAuth, run once locally)."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -26,10 +26,24 @@ class Calendar:
             self._token_path.write_text(self._creds.to_json())
         return build("calendar", "v3", credentials=self._creds, cache_discovery=False)
 
-    def create(self, event: Event) -> str:
-        """Insert the event and return its Google Calendar link."""
-        created = self._service().events().insert(calendarId=self._calendar_id, body=to_body(event)).execute()
-        return created["htmlLink"]
+    def create(self, event: Event) -> dict:
+        """Insert the event and return the created Google event resource (has "id" and "htmlLink")."""
+        return self._service().events().insert(calendarId=self._calendar_id, body=to_body(event)).execute()
+
+    def upcoming(self, days: int, limit: int = 30) -> list[dict]:
+        """Events from now until `days` ahead, soonest first (Google event resources)."""
+        now = datetime.now(timezone.utc)
+        result = self._service().events().list(
+            calendarId=self._calendar_id, timeMin=now.isoformat(), timeMax=(now + timedelta(days=days)).isoformat(),
+            singleEvents=True, orderBy="startTime", maxResults=limit,
+        ).execute()
+        return result.get("items", [])
+
+    def get(self, event_id: str) -> dict:
+        return self._service().events().get(calendarId=self._calendar_id, eventId=event_id).execute()
+
+    def delete(self, event_id: str) -> None:
+        self._service().events().delete(calendarId=self._calendar_id, eventId=event_id).execute()
 
 
 def to_body(event: Event) -> dict:

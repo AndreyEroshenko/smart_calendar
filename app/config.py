@@ -12,6 +12,7 @@ class Settings:
     calendar_id: str
     timezone: ZoneInfo
     claude_model: str
+    claude_enabled: bool  # False until ANTHROPIC_API_KEY is set; the bot then only does /add and /list
     data_dir: Path
 
     @property
@@ -31,5 +32,6 @@ def load() -> Settings:
         calendar_id=os.environ.get("GOOGLE_CALENDAR_ID", "primary"),
         timezone=ZoneInfo(os.environ.get("TIMEZONE", "Australia/Melbourne")),
         claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-5"),
+        claude_enabled=bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
         data_dir=Path(os.environ.get("DATA_DIR", "data")),
     )

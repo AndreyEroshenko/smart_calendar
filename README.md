@@ -48,6 +48,15 @@ ssh ubuntu@130.162.197.224 'cd smart_calendar && docker compose logs -f'
 
 ## Using it
 
+Commands (these work without an Anthropic key; leave `ANTHROPIC_API_KEY` empty to run in this mode):
+
+- `/add <date> [time] <title> [@ place]`: for example `/add fri 15:30-17:00 Swimming @ Aquatic Centre`. With no
+  time it's an all-day event, and without an end time it lasts an hour.
+- `/list [days]`: upcoming events (14 days by default). Tap 🗑 and a number to delete one.
+- `/help`: the full syntax.
+
+With Claude switched on:
+
 - Forward or paste a message, or send a photo or PDF of an invitation.
 - **✏️ Edit**: reply in plain words ("it's 3pm not 2", "drop the hotel"), and the bot re-extracts.
 - Relative dates ("this Saturday") are resolved against the forwarded message's original send time.

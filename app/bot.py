@@ -4,7 +4,8 @@ import html
 import logging
 from datetime import date, datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from googleapiclient.errors import HttpError
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -12,6 +13,7 @@ from . import config
 from .extract import Attachment, Extractor
 from .gcal import Calendar
 from .models import Event, Extraction
+from .quickadd import USAGE, parse_add
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -20,18 +22,28 @@ log = logging.getLogger(__name__)
 SUPPORTED_DOCS = {"application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"}
 MAX_FILE_BYTES = 20 * 1024 * 1024  # Bot API download limit
 
+COMMANDS = [
+    BotCommand("add", "Add an event: /add tomorrow 11am Dentist"),
+    BotCommand("list", "Upcoming events, with delete buttons (/list 30 for 30 days)"),
+    BotCommand("help", "How to use the bot"),
+]
+LIST_DAYS = 14
+
 
 class Bot:
     def __init__(self, settings: config.Settings):
         self.settings = settings
         self.store = Store(settings.db_path)
-        self.extractor = Extractor(settings.claude_model, settings.timezone)
+        self.extractor = Extractor(settings.claude_model, settings.timezone) if settings.claude_enabled else None
         self.calendar = Calendar(settings.google_token_path, settings.calendar_id)
 
     def build_app(self) -> Application:
-        app = Application.builder().token(self.settings.telegram_token).build()
+        app = Application.builder().token(self.settings.telegram_token).post_init(_set_commands).build()
         allowed = filters.User(user_id=list(self.settings.allowed_user_ids))
         app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("help", self.show_help, filters=allowed))
+        app.add_handler(CommandHandler("add", self.add, filters=allowed))
+        app.add_handler(CommandHandler("list", self.list_events, filters=allowed))
         app.add_handler(CommandHandler("cancel", self.cancel, filters=allowed))
         app.add_handler(MessageHandler(
             allowed & ~filters.COMMAND & (filters.TEXT | filters.PHOTO | filters.Document.ALL), self.on_message
@@ -49,10 +61,60 @@ class Bot:
                 f"Hi! Your Telegram user ID is {user.id}. Ask the admin to add it to ALLOWED_TELEGRAM_USER_IDS."
             )
             return
-        await update.message.reply_text(
+        await self.show_help(update, context)
+
+    async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        intro = (
             "Forward me an invitation, ticket or booking (text, photo or PDF) "
-            "and I'll suggest calendar events for you to confirm."
+            "and I'll suggest calendar events for you to confirm. Or use the commands:"
+            if self.extractor else "Commands:"
         )
+        await update.message.reply_text(
+            f"{intro}\n\n/add: add an event\n/list: upcoming events, tap 🗑 to delete one\n\n{USAGE}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await update.message.reply_text(USAGE, parse_mode=ParseMode.HTML)
+            return
+        today = datetime.now(self.settings.timezone).date()
+        try:
+            event = parse_add(" ".join(context.args), today, self.settings.timezone)
+        except ValueError as e:
+            await update.message.reply_text(f"⚠️ {html.escape(str(e))}\n\n{USAGE}", parse_mode=ParseMode.HTML)
+            return
+        created = await asyncio.to_thread(self.calendar.create, event)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Delete", callback_data=f"del:{created['id']}")]])
+        await update.message.reply_text(
+            f'{_render_event(event)}\n\n✅ <a href="{html.escape(created["htmlLink"])}">Added to Google Calendar</a>',
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard,
+        )
+
+    async def list_events(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        days = int(context.args[0]) if context.args and context.args[0].isdigit() else LIST_DAYS
+        events = await asyncio.to_thread(self.calendar.upcoming, days)
+        if not events:
+            await update.message.reply_text(f"No events in the next {days} days.")
+            return
+        lines = [f"<b>Next {days} days</b>"]
+        buttons = []
+        for n, item in enumerate(events, start=1):
+            lines.append(f"{n}. {html.escape(self._when_google(item))}: {html.escape(item.get('summary', '(no title)'))}")
+            buttons.append(InlineKeyboardButton(f"🗑 {n}", callback_data=f"del:{item['id']}"))
+        rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
+        await update.message.reply_text(
+            "\n".join(lines) + "\n\nTap a number to delete that event.",
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    def _when_google(self, item: dict) -> str:
+        """Short local start time of a Google event resource, e.g. "Fri 20 Nov 11:00"."""
+        start = item["start"]
+        if "date" in start:
+            return f"{_fmt_short(date.fromisoformat(start['date']))} (all day)"
+        when = datetime.fromisoformat(start["dateTime"]).astimezone(self.settings.timezone)
+        return f"{_fmt_short(when)} {when:%H:%M}"
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop("editing", None)
@@ -62,6 +124,11 @@ class Bot:
 
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
+        if self.extractor is None:
+            await msg.reply_text(
+                "Reading forwarded messages isn't switched on yet. Use /add to add an event, or /help.",
+            )
+            return
         editing = context.user_data.pop("editing", None)
         if editing and msg.text and not msg.forward_origin:
             await self._apply_correction(msg, editing, msg.text)
@@ -98,6 +165,9 @@ class Bot:
             await query.answer("Not allowed.")
             return
         action, _, raw_id = query.data.partition(":")
+        if action in ("del", "delok", "delno"):
+            await self._on_delete_button(query, action, raw_id)
+            return
         pending = self.store.get(int(raw_id))
         if pending is None or pending.status != "pending":
             await query.answer("Already handled.")
@@ -119,7 +189,8 @@ class Bot:
         elif action == "add":
             await query.answer("Adding…")
             links = [
-                await asyncio.to_thread(self.calendar.create, event) for event in pending.extraction.events
+                (await asyncio.to_thread(self.calendar.create, event))["htmlLink"]
+                for event in pending.extraction.events
             ]
             self.store.set_status(pending.id, "added", links)
             added = "\n".join(f'✅ <a href="{html.escape(link)}">Open in Google Calendar</a>' for link in links)
@@ -127,6 +198,37 @@ class Bot:
                 _render(pending.extraction) + "\n\n" + added,
                 parse_mode=ParseMode.HTML, disable_web_page_preview=True,
             )
+
+    async def _on_delete_button(self, query, action: str, event_id: str) -> None:
+        """del → ask to confirm; delok → delete; delno → back off."""
+        if action == "delno":
+            await query.answer("Kept")
+            await query.message.delete()
+            return
+        try:
+            item = await asyncio.to_thread(self.calendar.get, event_id)
+        except HttpError as e:
+            if e.resp.status not in (404, 410):
+                raise
+            item = {"status": "cancelled"}
+        if item.get("status") == "cancelled":
+            await query.answer("Already deleted.")
+            return
+        title = html.escape(item.get("summary", "(no title)"))
+        when = html.escape(self._when_google(item))
+        if action == "del":
+            await query.answer()
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Yes, delete", callback_data=f"delok:{event_id}"),
+                InlineKeyboardButton("Keep it", callback_data="delno:"),
+            ]])
+            await query.message.reply_text(
+                f"Delete <b>{title}</b> ({when})?", parse_mode=ParseMode.HTML, reply_markup=keyboard
+            )
+        else:
+            await asyncio.to_thread(self.calendar.delete, event_id)
+            await query.answer("Deleted")
+            await query.edit_message_text(f"🗑 Deleted <b>{title}</b> ({when}).", parse_mode=ParseMode.HTML)
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("handler error", exc_info=context.error)
@@ -191,6 +293,15 @@ def _when(event: Event) -> str:
 
 def _fmt_date(d: date | datetime) -> str:
     return f"{d:%a} {d.day} {d:%b %Y}"
+
+
+def _fmt_short(d: date | datetime) -> str:
+    return f"{d:%a} {d.day} {d:%b}"
+
+
+async def _set_commands(app: Application) -> None:
+    """Show the commands in Telegram's "/" menu."""
+    await app.bot.set_my_commands(COMMANDS)
 
 
 def main() -> None:
